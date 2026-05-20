@@ -1,0 +1,428 @@
+TrackMyIndoorWorkout                                     C. Assistant
+Request for Comments: BLE-FTMS-BIKES-01                      May 2026
+Category: Informational
+
+                 BLE FTMS Bike Communication Profile
+            (Implementation-Oriented RFC-Style Specification)
+
+Status of This Memo
+
+   This memo provides information for the TrackMyIndoorWorkout ecosystem.
+   It does not specify an Internet standard of any kind. Distribution of
+   this memo is unlimited.
+
+Abstract
+
+   This document specifies, in RFC style, how TrackMyIndoorWorkout
+   communicates with indoor bikes over Bluetooth Low Energy (BLE) using
+   FTMS (Fitness Machine Service), including real-world vendor deviations.
+   The objective is to provide sufficient detail to reproduce compatible
+   communication behavior in another project.
+
+1.  Conventions and Terminology
+
+1.1.  Requirements Language
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+   "OPTIONAL" in this document are to be interpreted as described in
+   BCP 14.
+
+1.2.  Scope
+
+   This specification covers ONLY bike-related communication paths,
+   including:
+
+   - Generic FTMS indoor bike behavior
+   - Vendor-specific deviations handled by this codebase
+   - Runtime merge/throttle behavior needed for fragmented FTMS streams
+
+   This specification does NOT attempt to describe non-bike equipment
+   protocols except where needed for bike exceptions (e.g., Concept2
+   BikeErg protocol path).
+
+2.  Architecture Overview
+
+   The communication stack is logically divided as follows:
+
+   +---------------------------------------------------------------+
+   | Application Runtime (FitnessEquipment)                        |
+   |  - discovery, feature read, control write, merge/throttle     |
+   +------------------------------+--------------------------------+
+                                  |
+   +------------------------------v--------------------------------+
+   | Device Descriptor Layer                                      |
+   |  - IndoorBikeDeviceDescriptor (baseline)                      |
+   |  - Matrix/LifeFitness/Cardiostrong specializations            |
+   +------------------------------+--------------------------------+
+                                  |
+   +------------------------------v--------------------------------+
+   | FTMS GATT Mapping                                               |
+   |  - service/characteristic UUIDs, opcodes, feature bits         |
+   +---------------------------------------------------------------+
+
+3.  GATT Profile (Bike FTMS)
+
+3.1.  Mandatory Service/Characteristics
+
+   Implementations targeting FTMS bikes MUST support:
+
+   +------------------------------+--------+------------------------+
+   | Entity                       | UUID   | Purpose                |
+   +------------------------------+--------+------------------------+
+   | Fitness Machine Service      | 0x1826 | Primary FTMS service   |
+   | Indoor Bike Data             | 0x2AD2 | Measurement stream     |
+   | Fitness Machine Feature      | 0x2ACC | Read/write capabilities|
+   | Fitness Machine Control Point| 0x2AD9 | Control procedures     |
+   | Fitness Machine Status       | 0x2ADA | Status notifications   |
+   +------------------------------+--------+------------------------+
+
+3.2.  Optional Supported-Range Characteristics
+
+   If advertised/supported, implementation SHOULD read:
+
+   +-------------------------------+--------+
+   | Characteristic                | UUID   |
+   +-------------------------------+--------+
+   | Supported Speed Range         | 0x2AD4 |
+   | Supported Inclination Range   | 0x2AD5 |
+   | Supported Resistance Range    | 0x2AD6 |
+   | Supported Heart Rate Range    | 0x2AD7 |
+   | Supported Power Range         | 0x2AD8 |
+   +-------------------------------+--------+
+
+4.  Control Point Procedures
+
+4.1.  Supported Opcodes (Defined and Used)
+
+   +----------------------------+--------+--------------------------+
+   | Operation                  | Opcode | Notes                    |
+   +----------------------------+--------+--------------------------+
+   | Request Control            | 0x00   | Sent on control connect  |
+   | Reset                      | 0x01   | Defined                  |
+   | Set Resistance Level       | 0x04   | Defined                  |
+   | Start or Resume            | 0x07   | Defined                  |
+   | Stop or Pause              | 0x08   | stop=0x01 pause=0x02     |
+   | Spin Down Control          | 0x13   | Defined + feature-gated  |
+   +----------------------------+--------+--------------------------+
+
+4.2.  Response Codes
+
+   +-------------------------+------+
+   | Response                | Code |
+   +-------------------------+------+
+   | Success                 | 0x01 |
+   | Op Code Not Supported   | 0x02 |
+   | Invalid Parameter       | 0x03 |
+   | Operation Failed        | 0x04 |
+   | Control Not Permitted   | 0x05 |
+   +-------------------------+------+
+
+4.3.  Control Write Preconditions
+
+   An implementation MUST NOT attempt control writes when:
+
+   - Bluetooth is OFF
+   - Control point characteristic is absent
+   - Local policy blocks start/stop signaling
+
+5.  Discovery and Session Initialization
+
+5.1.  Discovery Sequence
+
+   RECOMMENDED sequence:
+
+   +------+---------------------------------------------------------+
+   | Step | Action                                                  |
+   +------+---------------------------------------------------------+
+   | 1    | Connect device + discover services                      |
+   | 2    | Bind FTMS service (0x1826) and Indoor Bike Data (0x2AD2)|
+   | 3    | Read Fitness Machine Feature (0x2ACC), if enabled       |
+   | 4    | Optionally read Manufacturer Name (DIS), policy-based   |
+   | 5    | Connect control point and Request Control (0x00)        |
+   +------+---------------------------------------------------------+
+
+5.2.  Feature Parsing
+
+   Fitness Machine Feature value is interpreted as:
+
+   - bytes[0..3]: 32-bit read-features mask (little-endian)
+   - bytes[4..7]: 32-bit write-features mask (little-endian)
+
+   If fewer than 8 bytes are returned, implementation SHOULD pad with
+   zeros before parsing (robustness behavior used by this project).
+
+6.  Indoor Bike Data Parsing
+
+6.1.  Packet Model
+
+   Indoor Bike Data packet is treated as:
+
+   +----------------+---------------------+
+   | Field          | Encoding            |
+   +----------------+---------------------+
+   | Flags          | 2 bytes LE          |
+   | Payload        | Variable            |
+   +----------------+---------------------+
+
+6.2.  Baseline Flag Walk Order
+
+   Parser MUST traverse fields in this order:
+
+   1) Instant Speed           (special bit inversion rule)
+   2) Average Speed
+   3) Instant Cadence
+   4) Average Cadence
+   5) Total Distance
+   6) Resistance Level
+   7) Instantaneous Power
+   8) Average Power
+   9) Expended Energy block
+  10) Heart Rate
+  11) MET
+  12) Elapsed Time
+  13) Remaining Time
+
+6.3.  Field Encodings and Units
+
+   +-------------------------+------------+-------------------------+
+   | Metric                  | Raw Type   | Conversion              |
+   +-------------------------+------------+-------------------------+
+   | Instant Speed           | uint16     | value / 100.0 (km/h)    |
+   | Instant Cadence         | uint16     | value / 2.0 (rpm)       |
+   | Total Distance          | uint24     | meters                  |
+   | Resistance Level        | sint16     | direct                  |
+   | Instantaneous Power     | sint16     | watts                   |
+   | Total Energy            | uint16     | kcal                    |
+   | Energy per Hour         | uint16     | kcal/h                  |
+   | Energy per Minute       | uint8      | kcal/min                |
+   | Heart Rate              | uint8      | bpm                     |
+   | Elapsed Time            | uint16     | seconds                 |
+   +-------------------------+------------+-------------------------+
+
+6.4.  FTMS Bike Speed Bit Inversion
+
+   For Indoor Bike Data, speed presence bit is inverted relative to
+   standard positive-presence bits in the parser logic.
+
+   Effective rule in this implementation:
+
+   - if bit0 == 0  => Instant Speed is present
+   - if bit0 == 1  => Instant Speed absent
+
+6.5.  Not-Available Sentinel Values
+
+   Implementation MUST map the following raw values to NULL:
+
+   +---------+----------------------+
+   | Type    | Not Available Value  |
+   +---------+----------------------+
+   | uint8   | 0xFF                 |
+   | uint16  | 0xFFFF               |
+   | uint24  | 0xFFFFFF             |
+   | uint32  | 0xFFFFFFFF           |
+   | uint48  | 0xFFFFFFFFFFFF       |
+   +---------+----------------------+
+
+6.6.  Packet Length Validation
+
+   Parser computes expected consumed payload length from flags. Packet is
+   processable when:
+
+      received_length >= minimally_required_length
+
+   Exact length equality MUST NOT be required (robustness for vendor noise,
+   reserved bits, and partial inconsistencies).
+
+7.  Runtime Merge/Throttle Behavior
+
+7.1.  Problem Statement
+
+   Several bikes emit fragmented FTMS frames (e.g., one frame with speed,
+   another with distance, another with cadence+power). Treating each frame
+   in isolation yields sparse/incomplete records.
+
+7.2.  Required Behavior
+
+   Implementation SHOULD maintain a recent-frame buffer and periodically
+   produce a merged record selecting best available metrics across frame
+   types within a short time window.
+
+7.3.  Visual Flow
+
+   +--------------------+    +---------------------+    +----------------+
+   | BLE Notification A |    | BLE Notification B  |    | Notification C |
+   | (speed only)       |    | (distance only)     |    | (cad+power)    |
+   +---------+----------+    +----------+----------+    +-------+--------+
+             |                          |                       |
+             +-----------+--------------+-----------------------+
+                         v
+                +--------------------+
+                | Recent Frame Store |
+                +---------+----------+
+                          |
+                    [throttle tick]
+                          v
+                +--------------------+
+                | Merge Best Metrics |
+                +---------+----------+
+                          |
+                          v
+                +--------------------+
+                | Unified App Record |
+                +--------------------+
+
+8.  Vendor/Model-Specific Differences (Bikes)
+
+8.1.  Generic FTMS Bike
+
+   - Uses baseline parser with no vendor override.
+   - Acts as default fallback for unknown FTMS bikes.
+
+8.2.  Schwinn IC4/IC8 and Bowflex C7 (Nautilus family)
+
+   - Generally baseline-compatible FTMS packets.
+   - Operationally, calorie trust MAY be reduced by product policy in
+     certain model mappings.
+
+8.3.  Stages SB20
+
+   - Emits multiple packet profiles (metric-fragmented stream).
+   - Merge behavior is REQUIRED for accurate record reconstruction.
+
+8.4.  Yesoul S3
+
+   Typical alternating profiles observed:
+
+   +-------------------+-------------------------------------------+
+   | Profile           | Typical Content                           |
+   +-------------------+-------------------------------------------+
+   | Packet Type A     | speed + elapsed                           |
+   | Packet Type B     | cadence + distance + power + calories     |
+   +-------------------+-------------------------------------------+
+
+   - Merge behavior is REQUIRED to compose complete state.
+
+8.5.  Matrix Bike (FTMS Non-Conformant)
+
+   Observed special cases:
+
+   +--------------------+---------------+-----------------------------+
+   | Flags (hex)        | Length bytes  | Behavior                    |
+   +--------------------+---------------+-----------------------------+
+   | 0x15FE             | 20            | special parser path         |
+   | 0x1DFE             | 20            | special parser path         |
+   +--------------------+---------------+-----------------------------+
+
+   Device declares fields that do not fit actual payload length. Parser MUST
+   prioritize reliable subset extraction (speed/cadence/distance/resistance/
+   power) and ignore inconsistent implied fields.
+
+8.6.  Life Fitness Bike (FTMS Non-Conformant)
+
+   Observed special combinations:
+
+   +----------+---------+------------------------------------------+
+   | Flags    | Length  | Notes                                    |
+   +----------+---------+------------------------------------------+
+   | 0x09FA   | 26      | no HR variant                            |
+   | 0x0BFA   | 27      | with HR                                  |
+   | 0x19FA   | 28      | cooldown-style with remaining time       |
+   | 0x1BFA   | 29      | cooldown-style with HR + remaining time  |
+   +----------+---------+------------------------------------------+
+
+   Declared flag semantics do not always match payload reality. Parser MUST
+   apply vendor-specific cadence handling (inverse cadence presence logic in
+   this implementation path).
+
+8.7.  Cardiostrong IB50
+
+   - Distance is reported in decameters (10 m unit), not meters.
+   - Parser MUST scale raw distance by x10 relative to standard meter unit.
+
+8.8.  Concept2 BikeErg Exception
+
+   Concept2 BikeErg in this project follows Concept2-specific communication
+   path, not baseline FTMS Indoor Bike Data (`0x2AD2`) flow. Implementers
+   MUST treat it as a separate protocol family.
+
+9.  Interoperability Algorithm (Reference)
+
+   The following algorithm is RECOMMENDED:
+
+   1. Read 2-byte flags (LE).
+   2. Reset field index and metric descriptors for current packet.
+   3. If (vendor/model, flags, length) matches override table:
+        parse with vendor override.
+      Else:
+        parse with baseline FTMS bike parser.
+   4. Decode metrics with unit conversions.
+   5. Replace sentinel not-available values with NULL.
+   6. Store frame in short-lived merge buffer keyed by frame profile.
+   7. On throttle tick, merge best available metrics into unified record.
+   8. Emit unified record to upper layers.
+
+10.  Compatibility Matrix (Quick View)
+
+   +---------------------+----------------------+-----------------------+
+   | Equipment           | Base Path            | Mandatory Add-on      |
+   +---------------------+----------------------+-----------------------+
+   | Generic FTMS Bike   | FTMS baseline        | none                  |
+   | Schwinn IC4/IC8     | FTMS baseline        | policy nuance         |
+   | Bowflex C7          | FTMS baseline        | policy nuance         |
+   | Stages SB20         | FTMS baseline        | merge fragmented data |
+   | Yesoul S3           | FTMS baseline        | merge alternating data|
+   | Matrix Bike         | FTMS + override      | flag/len special path |
+   | Life Fitness Bike   | FTMS + override      | inverse cadence logic |
+   | Cardiostrong IB50   | FTMS + override      | distance x10 scaling  |
+   | Concept2 BikeErg    | Concept2-specific    | separate protocol     |
+   +---------------------+----------------------+-----------------------+
+
+11.  Security and Robustness Considerations
+
+   - Control writes SHOULD be gated by explicit capability and policy checks.
+   - Parser MUST be resilient to malformed short feature payloads.
+   - Parser SHOULD tolerate extra bytes and reserved-bit anomalies.
+   - Vendor overrides MUST be deterministic and narrow (flag+length guarded)
+     to avoid false positives on unrelated devices.
+
+12.  Implementation Checklist
+
+   [ ] Parse FTMS service and mandatory bike characteristics
+   [ ] Parse feature masks (read/write)
+   [ ] Implement control opcodes and preconditions
+   [ ] Implement baseline flag-walk parser with speed-bit inversion
+   [ ] Handle FTMS not-available sentinels as NULL
+   [ ] Validate packet with >= minimum required bytes
+   [ ] Implement merge/throttle for fragmented streams
+   [ ] Add vendor overrides: Matrix, Life Fitness, Cardiostrong IB50
+   [ ] Treat Concept2 BikeErg as separate protocol path
+
+13.  References (Project Source Anchors)
+
+   - FTMS UUIDs/opcodes/feature bits: `lib/devices/gatt/ftms.dart`
+   - Baseline FTMS descriptor behaviors:
+     `lib/devices/device_descriptors/fitness_machine_descriptor.dart`
+   - Indoor bike baseline parser:
+     `lib/devices/device_descriptors/indoor_bike_device_descriptor.dart`
+   - Vendor overrides:
+     - Matrix: `lib/devices/device_descriptors/matrix_bike_descriptor.dart`
+     - Life Fitness: `lib/devices/device_descriptors/life_fitness_bike_descriptor.dart`
+     - Cardiostrong: `lib/devices/device_descriptors/cardiostrong_ib50_descriptor.dart`
+   - Runtime merge/discovery/control path:
+     `lib/devices/gadgets/fitness_equipment.dart`
+   - Device model mapping:
+     `lib/devices/device_factory.dart`
+   - Behavioral test vectors:
+     `test/bowflex_ic7_test.dart`
+     `test/yesoul_s3_test.dart`
+     `test/matrix_bike_test.dart`
+     `test/life_fitness_indoor_bike_test.dart`
+     `test/stages_sb20_test.dart`
+     `test/devices/device_descriptors/cardiostrong_ib50_descriptor_test.dart`
+
+Author's Address
+
+   C. Assistant
+   TrackMyIndoorWorkout Documentation Update
+
